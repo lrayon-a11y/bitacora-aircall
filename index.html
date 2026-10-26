@@ -1,0 +1,242 @@
+import os
+import json
+from datetime import datetime, timedelta, timezone
+import requests
+
+# ==========================================
+# CONFIGURACIÓN Y CREDENCIALES DESDE SECRETOS
+# ==========================================
+AIRCALL_API_ID = os.environ.get("AIRCALL_API_ID", "116960c4f29c3886ece278a000f64268")
+AIRCALL_API_TOKEN = os.environ.get("AIRCALL_API_TOKEN", "d86cd83532b83753cb464d3885d0393d")
+BASE_URL = "https://api.aircall.io/v1/calls"
+
+TZ_MEXICO = timezone(timedelta(hours=-6))
+
+def obtener_rango_semana_anterior():
+    hoy = datetime.now(TZ_MEXICO)
+    hoy_inicio = hoy.replace(hour=0, minute=0, second=0, microsecond=0)
+    lunes_semana_actual = hoy_inicio - timedelta(days=hoy_inicio.weekday())
+    
+    lunes_pasado = lunes_semana_actual - timedelta(days=7)
+    domingo_pasado = lunes_semana_actual - timedelta(seconds=1)
+    
+    return lunes_pasado, domingo_pasado
+
+def obtener_llamadas_semana():
+    lunes_pasado, domingo_pasado = obtener_rango_semana_anterior()
+    from_timestamp = int(lunes_pasado.timestamp())
+    to_timestamp = int(domingo_pasado.timestamp())
+    num_semana = lunes_pasado.isocalendar()[1]
+    
+    params = {'from': from_timestamp, 'to': to_timestamp, 'per_page': 50, 'order': 'asc'}
+    todas_las_llamadas = []
+    page = 1
+    
+    while True:
+        params['page'] = page
+        response = requests.get(BASE_URL, auth=(AIRCALL_API_ID, AIRCALL_API_TOKEN), params=params)
+        if response.status_code != 200:
+            break
+            
+        data = response.json()
+        calls = data.get('calls', [])
+        todas_las_llamadas.extend(calls)
+        
+        meta = data.get('meta', {})
+        if not meta.get('next_page_link'):
+            break
+        page += 1
+
+    return todas_las_llamadas, num_semana, lunes_pasado, domingo_pasado
+
+def extraer_agente(call):
+    user = call.get('user')
+    if isinstance(user, dict) and user.get('name'):
+        return user.get('name')
+    assigned_to = call.get('assigned_to')
+    if isinstance(assigned_to, dict) and assigned_to.get('name'):
+        return assigned_to.get('name')
+    users = call.get('users')
+    if isinstance(users, list) and len(users) > 0:
+        p = users[0]
+        if isinstance(p, dict) and p.get('name'):
+            return p.get('name')
+    return "Sin Agente Asignado"
+
+def categorizar_llamada(call):
+    direction = call.get('direction', 'outbound')
+    answered = call.get('answered_at') is not None or call.get('status') == 'done'
+    
+    if direction == 'outbound':
+        return ("LLAMADA / SALIENTE CONTESTADA", "#008000") if answered else ("SALIENTE NO CONTESTADA", "#FF0000")
+    else:
+        return ("ENTRANTE ATENDIDA", "#800080") if answered else ("ENTRANTE PERDIDA", "#FFA500")
+
+def procesar_para_calendario(llamadas):
+    registros = []
+    for call in llamadas:
+        ts = call.get('started_at') or call.get('ended_at') or call.get('created_at')
+        if not ts:
+            continue
+            
+        dt = datetime.fromtimestamp(int(ts), tz=TZ_MEXICO)
+        agente = extraer_agente(call)
+        cat_nombre, cat_color = categorizar_llamada(call)
+        duracion = int(call.get('duration', 0))
+        
+        registros.append({
+            "agente": agente,
+            "dia_idx": dt.weekday(),
+            "hora": dt.hour,
+            "minuto": dt.minute,
+            "duracion": duracion,
+            "categoria": cat_nombre,
+            "color": cat_color
+        })
+    return registros
+
+def generar_html_todos_los_agentes(registros, num_semana, lunes_pasado, domingo_pasado):
+    agentes = sorted(list(set(r['agente'] for r in registros)))
+    rango_fechas_str = f"Semana del {lunes_pasado.strftime('%d/%m/%Y')} al {domingo_pasado.strftime('%d/%m/%Y')}"
+    
+    raw_json = json.dumps(registros)
+    agentes_json = json.dumps(agentes)
+    
+    html_content = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Reporte Semanal de Calendarios por Agente</title>
+    <style>
+        * {{ box-sizing: border-box; font-family: 'Segoe UI', Arial, sans-serif; }}
+        body {{ background-color: #eef2f5; margin: 0; padding: 20px; color: #333; }}
+        .page-header {{ max-width: 1200px; margin: 0 auto 20px auto; background: #111; color: #fff; padding: 15px 25px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }}
+        .agent-card {{ background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); max-width: 1200px; margin: 0 auto 35px auto; }}
+        .agent-title {{ font-size: 16px; font-weight: bold; color: #111; border-bottom: 2px solid #2b5c8f; padding-bottom: 8px; margin-bottom: 15px; text-transform: uppercase; }}
+        .calendar-grid {{ display: grid; grid-template-columns: 80px repeat(7, 1fr); border-top: 1px solid #ccc; position: relative; }}
+        .grid-header {{ font-weight: bold; text-align: center; padding: 10px; background: #fff; border-bottom: 2px solid #333; font-size: 12px; }}
+        .time-cell {{ text-align: right; padding-right: 12px; font-size: 11px; font-weight: 500; color: #555; height: 50px; transform: translateY(-8px); }}
+        .day-column {{ border-left: 1px solid #e0e0e0; height: 500px; position: relative; background: linear-gradient(to bottom, #fdfdfd 0%, #ffffff 100%); }}
+        .hour-line {{ position: absolute; left: 0; right: 0; border-top: 1px solid #e9e9e9; height: 50px; pointer-events: none; }}
+        .call-block {{ position: absolute; left: 6%; width: 88%; border-radius: 2px; opacity: 0.9; cursor: pointer; }}
+        .totals-table {{ width: 100%; border-collapse: collapse; margin-top: 25px; font-size: 12px; border-top: 2px solid #333; }}
+        .totals-table th {{ text-align: left; padding: 8px; border-bottom: 1px solid #ddd; background-color: #f4f4f4; }}
+        .totals-table td {{ padding: 8px; border-bottom: 1px solid #eee; }}
+        .totals-row-final {{ font-weight: bold; font-size: 13px; background-color: #eef5fc; }}
+        .totals-row-final td {{ color: #007bff; padding: 10px 8px; border-top: 2px solid #007bff; }}
+        .color-badge {{ display: inline-block; width: 12px; height: 12px; margin-right: 8px; vertical-align: middle; border-radius: 2px; }}
+    </style>
+</head>
+<body>
+<div class="page-header">
+    <h1 style="margin:0;font-size:18px;">BITÁCORA GRÁFICA SEMANAL DE LLAMADAS</h1>
+    <span style="font-size:14px;">{rango_fechas_str} | Semana {num_semana}</span>
+</div>
+<div id="calendars-container"></div>
+<script>
+    const allData = {raw_json};
+    const agentesList = {agentes_json};
+    const container = document.getElementById('calendars-container');
+
+    function formatTime(s) {{
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+        return [h, m, sec].map(v => String(v).padStart(2, '0')).join(':');
+    }}
+
+    agentesList.forEach(agenteName => {{
+        const agentCalls = allData.filter(d => d.agente === agenteName);
+        if (agentCalls.length === 0) return;
+
+        const card = document.createElement('div');
+        card.className = 'agent-card';
+        card.innerHTML = `
+            <div class="agent-title">Agente: ${{agenteName}}</div>
+            <div class="calendar-grid">
+                <div class="grid-header">HORA</div>
+                <div class="grid-header">LUNES</div>
+                <div class="grid-header">MARTES</div>
+                <div class="grid-header">MIÉRCOLES</div>
+                <div class="grid-header">JUEVES</div>
+                <div class="grid-header">VIERNES</div>
+                <div class="grid-header">SÁBADO</div>
+                <div class="grid-header">DOMINGO</div>
+                <div>
+                    <div class="time-cell">9:00</div><div class="time-cell">10:00</div>
+                    <div class="time-cell">11:00</div><div class="time-cell">12:00</div>
+                    <div class="time-cell">13:00</div><div class="time-cell">14:00</div>
+                    <div class="time-cell">15:00</div><div class="time-cell">16:00</div>
+                    <div class="time-cell">17:00</div><div class="time-cell">18:00</div>
+                </div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-0"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-1"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-2"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-3"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-4"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-5"></div>
+                <div class="day-column" id="day-${{agenteName.replace(/\\s+/g, '_')}}-6"></div>
+            </div>
+            <table class="totals-table">
+                <thead><tr><th>Tipos de seguimiento</th><th style="text-align:right;">Tiempo</th><th style="text-align:right;"># seguimientos</th><th style="text-align:right;">Tiempo promedio</th></tr></thead>
+                <tbody id="totals-${{agenteName.replace(/\\s+/g, '_')}}"></tbody>
+            </table>
+        `;
+        container.appendChild(card);
+
+        for (let i = 0; i < 7; i++) {{
+            const col = document.getElementById(`day-${{agenteName.replace(/\\s+/g, '_')}}-${{i}}`);
+            for (let h = 0; h < 10; h++) {{
+                const line = document.createElement('div');
+                line.className = 'hour-line';
+                line.style.top = `${{h * 50}}px`;
+                col.appendChild(line);
+            }}
+        }}
+
+        const stats = {{}};
+        let granTotalTiempo = 0, granTotalCount = 0;
+
+        agentCalls.forEach(item => {{
+            if (item.hora >= 9 && item.hora <= 18) {{
+                const col = document.getElementById(`day-${{agenteName.replace(/\\s+/g, '_')}}-${{item.dia_idx}}`);
+                const topPx = ((item.hora - 9) * 50) + ((item.minuto / 60) * 50);
+                const heightPx = Math.max(6, Math.min(45, (item.duracion / 3600) * 50 + 8));
+
+                const block = document.createElement('div');
+                block.className = 'call-block';
+                block.style.top = `${{topPx}}px`;
+                block.style.height = `${{heightPx}}px`;
+                block.style.backgroundColor = item.color;
+                block.title = `${{item.agente}} | ${{item.categoria}} | ${{item.hora}}:${{String(item.minuto).padStart(2,'0')}} (${{item.duracion}}s)`;
+                col.appendChild(block);
+            }}
+
+            if (!stats[item.categoria]) stats[item.categoria] = {{ color: item.color, duracionTotal: 0, count: 0 }};
+            stats[item.categoria].duracionTotal += item.duracion;
+            stats[item.categoria].count += 1;
+        }});
+
+        const tbody = document.getElementById(`totals-${{agenteName.replace(/\\s+/g, '_')}}`);
+        Object.keys(stats).forEach(cat => {{
+            const s = stats[cat];
+            granTotalTiempo += s.duracionTotal;
+            granTotalCount += s.count;
+            const avgSecs = s.count > 0 ? Math.round(s.duracionTotal / s.count) : 0;
+            tbody.innerHTML += `<tr><td><span class="color-badge" style="background-color:${{s.color}};"></span>${{cat}}</td><td style="text-align:right;">${{formatTime(s.duracionTotal)}}</td><td style="text-align:right;">${{s.count}}</td><td style="text-align:right;">${{formatTime(avgSecs)}}</td></tr>`;
+        }});
+
+        const granAvg = granTotalCount > 0 ? Math.round(granTotalTiempo / granTotalCount) : 0;
+        tbody.innerHTML += `<tr class="totals-row-final"><td>Totales</td><td style="text-align:right;">${{formatTime(granTotalTiempo)}}</td><td style="text-align:right;">${{granTotalCount}}</td><td style="text-align:right;">${{formatTime(granAvg)}}</td></tr>`;
+    }});
+</script>
+</body>
+</html>
+"""
+    # Importante: Guardar como index.html para que GitHub Pages lo sirva como página principal
+    with open("index.html", "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+if __name__ == "__main__":
+    raw_calls, num_semana, lunes_pasado, domingo_pasado = obtener_llamadas_semana()
+    if raw_calls:
+        registros = procesar_para_calendario(raw_calls)
+        generar_html_todos_los_agentes(registros, num_semana, lunes_pasado, domingo_pasado)
