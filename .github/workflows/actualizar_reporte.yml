@@ -2,20 +2,21 @@ name: Actualizar Bitacora Aircall
 
 on:
   schedule:
-    # Se ejecuta automáticamente todos los Lunes a las 06:00 AM UTC
     - cron: '0 6 * * 1'
-  workflow_dispatch: # Permite ejecutar el reporte manualmente desde GitHub con 1 clic
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Permiso explícito de escritura
 
     steps:
     - name: Descargar repositorio
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Configurar Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
@@ -31,7 +32,7 @@ jobs:
         python reporte_aircall.py
 
     - name: Desplegar en GitHub Pages
-      uses: peaceiris/actions-gh-pages@v3
+      uses: peaceiris/actions-gh-pages@v4
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./
